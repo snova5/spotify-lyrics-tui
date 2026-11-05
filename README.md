@@ -44,7 +44,7 @@ sudo pacman -S playerctl cava
 ## Usage
 
 ```bash
-git clone https://github.com/<your-username>/spotify-lyrics-tui.git
+git clone https://github.com/snova5/spotify-lyrics-tui.git
 cd spotify-lyrics-tui
 python3 spotify_lyrics.py
 ```
