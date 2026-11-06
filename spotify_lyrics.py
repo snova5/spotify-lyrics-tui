@@ -286,6 +286,133 @@ class Player:
         return self._pos
 
 
+IS_WINDOWS = sys.platform == "win32"
+
+
+def setup_windows_console():
+    try:
+        import ctypes
+        kernel = ctypes.windll.kernel32
+        handle = kernel.GetStdHandle(-11)
+        mode = ctypes.c_uint32()
+        if kernel.GetConsoleMode(handle, ctypes.byref(mode)):
+            kernel.SetConsoleMode(handle, mode.value | 0x0004)
+        kernel.SetConsoleOutputCP(65001)
+    except Exception:
+        pass
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
+
+def load_media_control():
+    try:
+        from winrt.windows.media.control import GlobalSystemMediaTransportControlsSessionManager as manager
+        return manager
+    except ImportError:
+        pass
+    try:
+        from winsdk.windows.media.control import GlobalSystemMediaTransportControlsSessionManager as manager
+        return manager
+    except ImportError:
+        return None
+
+
+def win_seconds(value):
+    if value is None:
+        return 0.0
+    if hasattr(value, "total_seconds"):
+        return value.total_seconds()
+    if hasattr(value, "duration"):
+        return value.duration / 10_000_000
+    return float(value)
+
+
+class WindowsPlayer:
+    def __init__(self, manager_cls):
+        self.track = None
+        self.status = "Stopped"
+        self._pos = 0.0
+        self._pos_time = 0.0
+        self._lock = threading.Lock()
+        self._cls = manager_cls
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        import asyncio
+        try:
+            asyncio.run(self._loop())
+        except Exception:
+            pass
+
+    async def _loop(self):
+        import asyncio
+        manager = await self._cls.request_async()
+        while True:
+            try:
+                info = await self._read(manager)
+            except Exception:
+                info = None
+            with self._lock:
+                if info:
+                    self.track = info["track"]
+                    self.status = info["status"]
+                    self._pos = info["position"]
+                    self._pos_time = time.monotonic()
+                else:
+                    self.track = None
+                    self.status = "Stopped"
+            await asyncio.sleep(SYNC_INTERVAL)
+
+    async def _read(self, manager):
+        from datetime import datetime, timezone
+        session = None
+        for s in manager.get_sessions():
+            if PLAYER in (s.source_app_user_model_id or "").lower():
+                session = s
+                break
+        if session is None:
+            return None
+        props = await session.try_get_media_properties_async()
+        if not props or not props.title:
+            return None
+        timeline = session.get_timeline_properties()
+        playing = int(session.get_playback_info().playback_status) == 4
+        pos = win_seconds(timeline.position)
+        if playing:
+            try:
+                updated = timeline.last_updated_time
+                if updated.tzinfo is None:
+                    updated = updated.replace(tzinfo=timezone.utc)
+                age = (datetime.now(timezone.utc) - updated).total_seconds()
+                if 0 < age < 3600:
+                    pos += age
+            except Exception:
+                pass
+        duration = win_seconds(timeline.end_time) - win_seconds(timeline.start_time)
+        return {
+            "track": {
+                "artist": props.artist or "",
+                "title": props.title,
+                "album": props.album_title or "",
+                "duration": max(0.0, duration),
+            },
+            "status": "Playing" if playing else "Paused",
+            "position": pos,
+        }
+
+    def sync(self):
+        pass
+
+    @property
+    def position(self):
+        with self._lock:
+            if self.status == "Playing":
+                return self._pos + (time.monotonic() - self._pos_time)
+            return self._pos
+
+
 CAVA_CONFIG = """[general]
 bars = {bars}
 framerate = 60
@@ -385,6 +512,68 @@ class AudioSource:
                 self.proc.kill()
         if self.cfg and os.path.exists(self.cfg):
             os.remove(self.cfg)
+
+
+class WindowsAudio(AudioSource):
+    def _start(self):
+        self._stopped = False
+        self._updated = 0.0
+        try:
+            import numpy
+            import soundcard
+        except ImportError:
+            return
+        self._ready = threading.Event()
+        threading.Thread(target=self._capture, daemon=True).start()
+        self._ready.wait(2.0)
+
+    def _capture(self):
+        try:
+            import warnings
+            import numpy as np
+            import soundcard as sc
+            warnings.filterwarnings("ignore", category=getattr(sc, "SoundcardRuntimeWarning", RuntimeWarning))
+            rate, size, hop = 48000, 2048, 1024
+            speaker = sc.default_speaker()
+            mic = sc.get_microphone(id=str(speaker.name), include_loopback=True)
+            freqs = np.fft.rfftfreq(size, 1 / rate)
+            edges = np.searchsorted(freqs, np.geomspace(40, 14000, self.n + 1))
+            tilt = 1 + np.linspace(0, 3, self.n)
+            window = np.hanning(size)
+            buf = np.zeros(size)
+            peak = 4.0
+            with mic.recorder(samplerate=rate, blocksize=hop) as rec:
+                self.live = True
+                self._ready.set()
+                while not self._stopped:
+                    data = rec.record(numframes=hop)
+                    mono = data.mean(axis=1) if data.ndim > 1 else data
+                    if len(mono) >= size:
+                        buf = mono[-size:]
+                    else:
+                        buf = np.concatenate([buf[len(mono):], mono])
+                    spec = np.abs(np.fft.rfft(buf * window))
+                    bands = np.array([spec[a:max(a + 1, b)].max() for a, b in zip(edges[:-1], edges[1:])])
+                    bands = np.sqrt(bands * tilt)
+                    peak = max(peak * 0.997, float(bands.max()), 4.0)
+                    with self.lock:
+                        self.values = np.clip(bands / peak, 0, 1).tolist()
+                        self._updated = time.monotonic()
+        except Exception:
+            pass
+        self.live = False
+        self._ready.set()
+
+    def read(self, playing, now):
+        if self.live:
+            with self.lock:
+                if time.monotonic() - self._updated > 0.25:
+                    return [0.0] * self.n
+                return list(self.values)
+        return self._fake(playing, now)
+
+    def stop(self):
+        self._stopped = True
 
 
 def resample(vals, n):
@@ -861,18 +1050,33 @@ class Renderer:
 
 
 def main():
-    if not shutil.which("playerctl"):
-        print("playerctl is missing. Install it with: sudo dnf install playerctl")
-        sys.exit(1)
+    if IS_WINDOWS:
+        setup_windows_console()
+        manager = load_media_control()
+        if manager is None:
+            print("The Windows media packages are missing. Install them with:")
+            print("  python -m pip install winrt-Windows.Media.Control winrt-Windows.Foundation winrt-Windows.Foundation.Collections")
+            sys.exit(1)
+        player = WindowsPlayer(manager)
+    else:
+        if not shutil.which("playerctl"):
+            print("playerctl is missing. Install it with: sudo dnf install playerctl")
+            sys.exit(1)
+        player = Player()
 
     use_vis = "--no-visualizer" not in sys.argv
-    audio = AudioSource() if use_vis else None
+    audio = None
+    if use_vis:
+        audio = WindowsAudio() if IS_WINDOWS else AudioSource()
     if use_vis and not audio.live:
-        print("cava not found or could not start, using a simulated visualizer.")
-        print("For a real one: sudo dnf install cava")
+        if IS_WINDOWS:
+            print("Could not capture system audio, using a simulated visualizer.")
+            print("For a real one: python -m pip install soundcard numpy")
+        else:
+            print("cava not found or could not start, using a simulated visualizer.")
+            print("For a real one: sudo dnf install cava")
         time.sleep(1.5)
 
-    player = Player()
     store = LyricsStore()
     renderer = Renderer(visualizer=use_vis, big="--small-text" not in sys.argv)
     frame_time = 1 / FPS
