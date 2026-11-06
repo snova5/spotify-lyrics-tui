@@ -46,10 +46,24 @@ sudo pacman -S playerctl cava
 ```bash
 git clone https://github.com/snova5/spotify-lyrics-tui.git
 cd spotify-lyrics-tui
-python3 spotify_lyrics.py
+./install.sh
+```
+
+Then open it from any terminal with:
+
+```bash
+spotifylyr
 ```
 
 Start playing something in Spotify. Press **Ctrl+C** to quit.
+
+The installer copies the script to `~/.local/share/spotifylyr` and adds the `spotifylyr` command to `~/.local/bin`. No root needed. To update, `git pull` and run `./install.sh` again. To remove it:
+
+```bash
+./install.sh --uninstall
+```
+
+You can also run it without installing: `python3 spotify_lyrics.py`.
 
 ### Options
 
@@ -57,6 +71,8 @@ Start playing something in Spotify. Press **Ctrl+C** to quit.
 |---|---|
 | `--small-text` | Show the current line at normal size instead of big block letters |
 | `--no-visualizer` | Turn off the background audio visualizer |
+
+Example: `spotifylyr --small-text`
 
 Want everything bigger? Zoom your terminal (`Ctrl+Shift++` in GNOME Terminal / Kitty, `Ctrl++` in Konsole) — the layout adapts automatically.
 
