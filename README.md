@@ -41,6 +41,19 @@ sudo apt install playerctl cava
 sudo pacman -S playerctl cava
 ```
 
+### Gentoo
+
+```bash
+echo "media-sound/cava pipewire" | sudo tee /etc/portage/package.use/cava
+sudo emerge --ask media-sound/playerctl media-sound/cava
+```
+
+Full guide, including Spotify and the PulseAudio option: [docs/gentoo.md](docs/gentoo.md)
+
+### Linux From Scratch
+
+Build playerctl and cava from source with their BLFS dependencies. Step-by-step guide: [docs/lfs.md](docs/lfs.md)
+
 ## Usage
 
 ```bash
